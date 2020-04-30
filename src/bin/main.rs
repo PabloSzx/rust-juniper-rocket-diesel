@@ -4,12 +4,27 @@ use juniper::{object, FieldResult, RootNode};
 
 use rocket::{response::content, State};
 
-pub struct Database {}
+pub struct Context {
+    pub pool: r2d2::Pool<r2d2_diesel::ConnectionManager<PgConnection>>,
+}
 
-impl juniper::Context for Database {}
+impl juniper::Context for Context {}
+
+impl Context {
+    fn db_connection<F, T>(&self, action: F) -> T
+    where
+        F: Fn(r2d2::PooledConnection<ConnectionManager<PgConnection>>) -> T,
+    {
+        let connection = self.pool.get().unwrap();
+
+        action(connection)
+    }
+}
 
 extern crate diesel;
 extern crate diesel_demo;
+extern crate r2d2;
+extern crate r2d2_diesel;
 
 use self::diesel::prelude::*;
 use self::diesel_demo::*;
@@ -19,30 +34,34 @@ use diesel_demo::schema::posts::dsl::*;
 
 pub struct Query {}
 
-#[object]
+#[object(
+    Context = Context
+)]
 impl Query {
-    fn allPosts() -> FieldResult<Vec<Post>> {
-        let connection = establish_connection();
+    fn all_posts(ctx: &Context) -> FieldResult<Vec<Post>> {
+        ctx.db_connection(|db| {
+            let all_posts = posts.load::<Post>(&*db).expect("asd");
 
-        let all_posts = posts.load::<Post>(&connection).expect("asd");
-
-        Ok(all_posts)
+            Ok(all_posts)
+        })
     }
 }
 
 pub struct Mutation {}
 
-#[object]
+#[object(
+    Context = Context
+)]
 impl Mutation {
-    fn createPost(post: NewPost) -> FieldResult<Post> {
-        let connection = establish_connection();
+    fn createPost(ctx: &Context, post: NewPost) -> FieldResult<Post> {
+        ctx.db_connection(|db| {
+            let new_post = diesel::insert_into(schema::posts::table)
+                .values(&post)
+                .get_result(&*db)
+                .expect("error saving");
 
-        let new_post = diesel::insert_into(schema::posts::table)
-            .values(post)
-            .get_result(&connection)
-            .expect("error saving");
-
-        Ok(new_post)
+            Ok(new_post)
+        })
     }
 }
 
@@ -55,22 +74,40 @@ fn graphiql() -> content::Html<String> {
 
 #[rocket::get("/graphql?<request>")]
 fn get_graphql_handler(
+    ctx: State<Context>,
     request: juniper_rocket::GraphQLRequest,
     schema: State<Schema>,
 ) -> juniper_rocket::GraphQLResponse {
-    request.execute(&schema, &())
+    request.execute(&schema, &ctx)
 }
 
 #[rocket::post("/graphql", data = "<request>")]
 fn post_graphql_handler(
+    ctx: State<Context>,
     request: juniper_rocket::GraphQLRequest,
     schema: State<Schema>,
 ) -> juniper_rocket::GraphQLResponse {
-    request.execute(&schema, &())
+    request.execute(&schema, &ctx)
 }
 
+use std::env;
+extern crate dotenv;
+use dotenv::dotenv;
+
+use diesel::pg::PgConnection;
+use r2d2_diesel::ConnectionManager;
+
 fn main() {
+    dotenv().ok();
+
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
+    let manager = ConnectionManager::<PgConnection>::new(database_url);
+
+    let pool = r2d2::Pool::builder().max_size(15).build(manager).unwrap();
+
     let server = rocket::ignite()
+        .manage(Context { pool })
         .manage(Schema::new(Query {}, Mutation {}))
         .mount(
             "/",
